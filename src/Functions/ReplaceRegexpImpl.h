@@ -5,8 +5,19 @@
 #include <IO/WriteHelpers.h>
 
 #include "config.h"
+
 #include <re2_st/re2.h>
 
+#if USE_VECTORSCAN
+#    include <hs.h>
+#endif
+
+// TODO std::string_view
+// TODO tests (functional/perf)
+// TODO integrate with regexp cache?
+// TODO typedefs for hyperscan
+// TODO put under config parameter
+// TODO proper error handling (see Regexps.h)
 
 namespace DB
 {
@@ -46,7 +57,8 @@ struct ReplaceRegexpImpl
     /// E.g. "abc\1de\2fg\1\2" --> inst("abc"), inst(1), inst("de"), inst(2), inst("fg"), inst(1), inst(2)
     using Instructions = std::vector<Instruction>;
 
-    static constexpr int max_captures = 10;
+    static constexpr int max_captures_re2 = 10;
+    static constexpr int max_captures_vectorscan = 1;
 
     static Instructions createInstructions(std::string_view replacement, int num_captures)
     {
@@ -87,17 +99,17 @@ struct ReplaceRegexpImpl
         return instructions;
     }
 
-    static void processString(
-        const re2_st::StringPiece & haystack,
+    static void processStringWithRe2(
+        const char * haystack_data,
+        size_t haystack_length,
         ColumnString::Chars & res_data,
         ColumnString::Offset & res_offset,
         const re2_st::RE2 & searcher,
         int num_captures,
         const Instructions & instructions)
     {
-        const size_t haystack_length = haystack.length();
-
-        re2_st::StringPiece matches[max_captures];
+        re2_st::StringPiece haystack(haystack_data, haystack_length);
+        re2_st::StringPiece matches[max_captures_re2];
 
         size_t copy_pos = 0;
         size_t match_pos = 0;
@@ -170,6 +182,102 @@ struct ReplaceRegexpImpl
         ++res_offset;
     }
 
+#ifdef USE_VECTORSCAN
+    static void processStringWithVectorscan(
+        const char * haystack_data,
+        size_t haystack_length,
+        ColumnString::Chars & res_data,
+        ColumnString::Offset & res_offset,
+        hs_database_t * db,
+        hs_scratch_t * scratch,
+        const Instructions & instructions)
+    {
+        size_t match_pos = 0;
+
+        // To pass information into on_match(). Quite cumersome but hyper/vectorscan API doesn't allow
+        // standard lambda captures for on_match().
+        struct Context
+        {
+            const char * haystack_data;
+            size_t haystack_length;
+            const Instructions & instructions;
+            ColumnString::Chars & res_data;
+            ColumnString::Offset & res_offset;
+            size_t match_pos;
+        };
+
+        Context context{haystack_data, haystack_length, instructions, res_data, res_offset, match_pos};
+
+        auto on_match = [](unsigned int /*id*/,
+                           unsigned long long from, // NOLINT
+                           unsigned long long to, // NOLINT
+                           unsigned int /*flags*/,
+                           void * context_) -> int
+        {
+            Context * ctx = static_cast<Context *>(context_);
+
+            const char * ctx_haystack_data = ctx->haystack_data;
+            size_t ctx_haystack_length = ctx->haystack_length;
+            const Instructions & ctx_instructions = ctx->instructions;
+            ColumnString::Chars & ctx_res_data = ctx->res_data;
+            ColumnString::Offset & ctx_res_offset = ctx->res_offset;
+            size_t & ctx_match_pos = ctx->match_pos;
+
+            /// Copy prefix before matched regexp without modification
+            size_t bytes_to_copy = from - ctx_match_pos;
+            ctx_res_data.resize(ctx_res_data.size() + bytes_to_copy);
+            memcpy(&ctx_res_data[ctx_res_offset], ctx_haystack_data + ctx_match_pos, bytes_to_copy);
+            ctx_res_offset += bytes_to_copy;
+            ctx_match_pos = from;
+
+            /// Substitute inside current match using instructions
+            for (const auto & instr : ctx_instructions)
+            {
+                if (instr.substitution_num >= 0)
+                {
+                    assert(instr.substitution_num == 0);
+                    std::string_view replacement = std::string_view(ctx_haystack_data, ctx_haystack_data + ctx_haystack_length);
+
+                    ctx_res_data.resize(ctx_res_data.size() + replacement.size());
+                    memcpy(&ctx_res_data[ctx_res_offset], replacement.data(), replacement.size());
+                    ctx_res_offset += replacement.size();
+                }
+                else
+                {
+                    std::string_view replacement = instr.literal;
+
+                    ctx_res_data.resize(ctx_res_data.size() + replacement.size());
+                    memcpy(&ctx_res_data[ctx_res_offset], replacement.data(), replacement.size());
+                    ctx_res_offset += replacement.size();
+                }
+            }
+
+            ctx_match_pos = to;
+
+            if constexpr (replace == ReplaceRegexpTraits::Replace::First)
+                return 1; /// Cease matching
+            else
+                return 0;
+        };
+
+        hs_error_t err = hs_scan(db, haystack_data, static_cast<unsigned>(haystack_length), 0, scratch, on_match, &context);
+        if (err != HS_SUCCESS && err != HS_SCAN_TERMINATED)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "err during evaluation");
+
+        /// Copy suffix from match_pos to end of haystack
+        if (match_pos != haystack_length)
+        {
+            size_t bytes_to_copy = haystack_length - match_pos;
+            res_data.resize(res_data.size() + bytes_to_copy);
+            memcpy(&res_data[res_offset], haystack_data + match_pos, bytes_to_copy);
+        }
+
+        res_data.resize(res_data.size() + 1);
+        res_data[res_offset] = 0;
+        ++res_offset;
+    }
+#endif
+
     static void vector(
         const ColumnString::Chars & data,
         const ColumnString::Offsets & offsets,
@@ -188,17 +296,59 @@ struct ReplaceRegexpImpl
         regexp_options.set_log_errors(false);
 
         re2_st::RE2 searcher(needle, regexp_options);
-        int num_captures = std::min(searcher.NumberOfCapturingGroups() + 1, max_captures);
+        int num_captures_in_needle = searcher.NumberOfCapturingGroups() + 1; // + 1 due to \0
 
-        Instructions instructions = createInstructions(replacement, num_captures);
+        if (num_captures_in_needle == 0)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "The pattern has invalid syntax");
+
+#ifdef USE_VECTORSCAN
+        // TODO comment what the vectorscan shortcut does and when we use it
+        bool use_vectorscan = (num_captures_in_needle <= 1);
+        if (use_vectorscan)
+        {
+            // TODO add error handling or (better) make use the regexp cache (... not possible due to SOM --> perf regression)
+            hs_database_t * db = nullptr;
+            hs_compile_error_t * compile_error;
+
+            hs_error_t err = hs_compile(
+                needle.c_str(),
+                HS_FLAG_SOM_LEFTMOST | HS_FLAG_DOTALL | HS_FLAG_ALLOWEMPTY | HS_FLAG_UTF8, // single_match removed, som_leftmost added, need to set horizon flag for som_leftmost?
+                HS_MODE_BLOCK,
+                nullptr,
+                &db, &compile_error);
+
+            hs_scratch_t * scratch = nullptr;
+            if (err = hs_alloc_scratch(db, &scratch); err != HS_SUCCESS)
+                throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Could not allocate scratch space for hyperscan");
+
+            num_captures_in_needle = std::min(num_captures_in_needle, max_captures_vectorscan);
+            Instructions instructions = createInstructions(replacement, num_captures_in_needle);
+
+            for (size_t i = 0; i < size; ++i)
+            {
+                size_t from = i > 0 ? offsets[i - 1] : 0;
+                const char * haystack_data = reinterpret_cast<const char *>(data.data() + from);
+                size_t haystack_length = static_cast<unsigned>(offsets[i] - from - 1);
+                processStringWithVectorscan(haystack_data, haystack_length, res_data, res_offset, db, scratch, instructions);
+                res_offsets[i] = res_offset;
+            }
+
+            return;
+        }
+#endif
+        num_captures_in_needle = std::min(num_captures_in_needle, max_captures_re2);
+        Instructions instructions = createInstructions(replacement, num_captures_in_needle);
 
         /// Cannot perform search for whole columns. Will process each string separately.
         for (size_t i = 0; i < size; ++i)
         {
             size_t from = i > 0 ? offsets[i - 1] : 0;
-            re2_st::StringPiece haystack(reinterpret_cast<const char *>(data.data() + from), offsets[i] - from - 1);
+            const char * haystack_data = reinterpret_cast<const char *>(data.data() + from);
+            size_t haystack_length = static_cast<unsigned>(offsets[i] - from - 1);
 
-            processString(haystack, res_data, res_offset, searcher, num_captures, instructions);
+            processStringWithRe2(haystack_data, haystack_length, res_data, res_offset, searcher, num_captures_in_needle, instructions);
             res_offsets[i] = res_offset;
         }
     }
@@ -221,16 +371,17 @@ struct ReplaceRegexpImpl
         regexp_options.set_log_errors(false);
 
         re2_st::RE2 searcher(needle, regexp_options);
-        int num_captures = std::min(searcher.NumberOfCapturingGroups() + 1, max_captures);
+        int num_captures = std::min(searcher.NumberOfCapturingGroups() + 1, max_captures_re2);
 
         Instructions instructions = createInstructions(replacement, num_captures);
 
         for (size_t i = 0; i < size; ++i)
         {
             size_t from = i * n;
-            re2_st::StringPiece haystack(reinterpret_cast<const char *>(data.data() + from), n);
+            const char * haystack_data = reinterpret_cast<const char *>(data.data() + from);
+            size_t haystack_length = n;
 
-            processString(haystack, res_data, res_offset, searcher, num_captures, instructions);
+            processStringWithRe2(haystack_data, haystack_length, res_data, res_offset, searcher, num_captures, instructions);
             res_offsets[i] = res_offset;
         }
     }
